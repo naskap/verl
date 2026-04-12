@@ -111,6 +111,11 @@ algorithm:
 
 # config for the trainer
 trainer:
+  # Enable Prompt History Tracker
+  greso: False
+  target_easy_ratio: 0.083
+  target_hard_ratio: 0.167
+  delta_p: 0.01
 
   # Whether to balance batch sizes across distributed workers
   balance_batch: True

@@ -71,6 +71,8 @@ from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.config import DistillationConfig, EngineConfig
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
+from verl.trainer.ppo.greso_utils import PromptHistoryTracker, DataProtoBuffer, get_next_target_size
+from collections import defaultdict
 
 
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
@@ -311,6 +313,24 @@ class RayPPOTrainer:
         # kl loss control currently not suppoorted
         if self.config.algorithm.use_kl_in_reward:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
+
+        # Init greso state
+        self.greso = self.config.trainer.get("greso", False)
+        if self.greso:
+            self.prompt_tracker = PromptHistoryTracker(
+                target_easy_ratio=self.config.trainer.get("target_easy_ratio", 0.083), 
+                target_hard_ratio=self.config.trainer.get("target_hard_ratio", 0.167), 
+                delta_p=self.config.trainer.get("delta_p", 0.01)
+            )
+            self.prompt_tracker.p_e_easy = 0.5
+            self.prompt_tracker.p_e_hard = 0.5
+            
+            self.pre_rollout_buffer = DataProtoBuffer()
+            self.post_rollout_buffer = DataProtoBuffer()
+            
+            # Initial sampling batch size from dataloader batch
+            self.rollout_batch_size = self.config.data.get("rollout_batch_size", self.config.data.train_batch_size)
+            self.adaptive_sampling_bs = self.rollout_batch_size
 
         self.use_prefix_grouper = self.config.actor_rollout_ref.actor.get("use_prefix_grouper", False)
         self.use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
@@ -946,6 +966,10 @@ class RayPPOTrainer:
         dataloader_local_path = os.path.join(local_global_step_folder, "data.pt")
         dataloader_state_dict = self.train_dataloader.state_dict()
         torch.save(dataloader_state_dict, dataloader_local_path)
+        
+        if getattr(self, "greso", False):
+            prompt_tracker_path = os.path.join(local_global_step_folder, "prompt_tracker.json")
+            self.prompt_tracker.save(prompt_tracker_path)
 
         # latest checkpointed iteration tracker (for atomic usage)
         if (
@@ -1029,6 +1053,10 @@ class RayPPOTrainer:
                 self.train_dataloader.load_state_dict(dataloader_state_dict)
         else:
             print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
+            
+        if getattr(self, "greso", False):
+            prompt_tracker_path = os.path.join(global_step_folder, "prompt_tracker.json")
+            self.prompt_tracker.load(prompt_tracker_path)
 
     def _start_profiling(self, do_profile: bool) -> None:
         """Start profiling for all worker groups if profiling is enabled."""
@@ -1364,10 +1392,23 @@ class RayPPOTrainer:
                     [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
                 )
 
-                gen_batch = self._get_gen_batch(batch)
-
                 # pass global_steps to trace
-                gen_batch.meta_info["global_steps"] = self.global_steps
+                batch.meta_info["global_steps"] = self.global_steps
+                
+                # greso pre-rollout probabilistic filtering
+                if self.greso:
+                    prompts_decoded = batch.non_tensor_batch["prompt"]
+                    filtered_batch = self.prompt_tracker.pre_rollout_probabilistic_filter(batch, prompts_decoded)
+                    
+                    if filtered_batch is not None:
+                        self.pre_rollout_buffer.append(filtered_batch)
+                        
+                    if len(self.pre_rollout_buffer) < self.adaptive_sampling_bs:
+                        continue
+                        
+                    batch = self.pre_rollout_buffer.pop_batch(self.adaptive_sampling_bs)
+                
+                gen_batch = self._get_gen_batch(batch)
                 gen_batch_output = gen_batch.repeat(
                     repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
                 )
@@ -1448,6 +1489,35 @@ class RayPPOTrainer:
 
                         # extract reward_tensor and reward_extra_infos_dict for training
                         reward_tensor, reward_extra_infos_dict = extract_reward(batch)
+                        
+                        # Post-rollout filtering
+                        if self.greso:
+                            n_responses_per_prompt = self.config.actor_rollout_ref.rollout.n
+                            filtered_batch, zero_var_ratio = self.prompt_tracker.post_rollout_filter(
+                                batch, reward_tensor, n_responses_per_prompt
+                            )
+                            
+                            if filtered_batch is not None:
+                                self.post_rollout_buffer.append(filtered_batch)
+                                
+                            target_batch_size = self.config.data.train_batch_size
+                            b_delta = target_batch_size - (len(self.post_rollout_buffer) // n_responses_per_prompt)
+                            b_delta = b_delta if b_delta > 0 else self.rollout_batch_size # if negative the next dataloader batch will correspond to a new training batch
+                            
+                            self.adaptive_sampling_bs = get_next_target_size(
+                                b_delta=b_delta,
+                                default_batch_size=self.rollout_batch_size,
+                                zero_variance_ratio=zero_var_ratio,
+                                beta=1.25
+                            )
+                            
+                            if len(self.post_rollout_buffer) < target_batch_size * n_responses_per_prompt:
+                                continue
+                                
+                            batch = self.post_rollout_buffer.pop_batch(target_batch_size * n_responses_per_prompt)
+                            
+                            # re-extract reward_tensor and reward_extra_infos_dict since batch changed
+                            reward_tensor, reward_extra_infos_dict = extract_reward(batch)
 
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
@@ -1601,6 +1671,33 @@ class RayPPOTrainer:
 
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
+
+                    if self.greso:
+                        # Update prompt history tracker
+                        prompts_decoded = batch.non_tensor_batch["prompt"]
+                        scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
+                        
+                        
+                        prompt_to_scores = defaultdict(list)
+                        for pt, score in zip(prompts_decoded, scores):
+                            prompt_to_scores[pt].append(score)
+                            
+                        pt_list = list(prompt_to_scores.keys())
+                        rw_list = [prompt_to_scores[pt] for pt in pt_list]
+                        self.prompt_tracker.update(self.global_steps, pt_list, rw_list)
+                        
+                        num_prompts = len(pt_list)
+                        n_easy = sum(1 for p in pt_list if self.prompt_tracker.history[self.prompt_tracker.get_prompt_id(p)]["streak_type"] == "easy")
+                        n_hard = sum(1 for p in pt_list if self.prompt_tracker.history[self.prompt_tracker.get_prompt_id(p)]["streak_type"] == "hard")
+                        
+                        if num_prompts > 0:
+                            obs_easy_ratio = n_easy / num_prompts
+                            obs_hard_ratio = n_hard / num_prompts
+                            self.prompt_tracker.adjust_p_e(obs_easy_ratio, obs_hard_ratio)
+                            metrics["prompt_tracking/p_e_easy"] = self.prompt_tracker.p_e_easy
+                            metrics["prompt_tracking/p_e_hard"] = self.prompt_tracker.p_e_hard
+                            metrics["prompt_tracking/obs_easy_ratio"] = obs_easy_ratio
+                            metrics["prompt_tracking/obs_hard_ratio"] = obs_hard_ratio
 
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
