@@ -436,7 +436,7 @@ def clip_prompt_token_ids_to_max_length(prompt_ids: list[int], max_length: int) 
     Chat checkpoints pack the active context and generation prompt at the end; dropping
     prefix tokens matches common ``truncation_side='left'`` behavior. Used so
     ``tokenizer.pad(..., max_length=...)`` never receives sequences longer than the
-    configured rollout prompt length (HF pad does not shrink unless ``truncation=True``).
+    configured rollout prompt length (some HF versions do not truncate inside ``pad``).
     """
     if len(prompt_ids) <= max_length:
         return prompt_ids
@@ -694,7 +694,6 @@ class AgentLoopWorker:
             {"input_ids": output.prompt_ids},
             padding="max_length",
             max_length=self.rollout_config.prompt_length,
-            truncation=True,
             return_tensors="pt",
             return_attention_mask=True,
         )
