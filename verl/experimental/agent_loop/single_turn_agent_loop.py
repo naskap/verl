@@ -53,6 +53,7 @@ class SingleTurnAgentLoop(AgentLoopBase):
             images=images,
             videos=videos,
         )
+        prompt_ids = self._clip_prompt_ids(prompt_ids)
 
         # 3. generate sequences
         metrics = {}
@@ -163,10 +164,12 @@ class DiffusionSingleTurnAgentLoop(AgentLoopBase):
         videos = multi_modal_data.get("videos")
 
         # 2. apply chat template and tokenize
-        prompt_ids = await self.apply_chat_template(raw_prompt, images=images, videos=videos)
+        prompt_ids = self._clip_prompt_ids(await self.apply_chat_template(raw_prompt, images=images, videos=videos))
 
         if raw_negative_prompt is not None:
-            negative_prompt_ids = await self.apply_chat_template(raw_negative_prompt, images=images, videos=videos)
+            negative_prompt_ids = self._clip_prompt_ids(
+                await self.apply_chat_template(raw_negative_prompt, images=images, videos=videos)
+            )
         else:
             negative_prompt_ids = None
 

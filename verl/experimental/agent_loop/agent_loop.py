@@ -305,6 +305,9 @@ class AgentLoopBase(ABC):
         self.system_prompt = initialize_system_prompt(self.tokenizer, **self.apply_chat_template_kwargs)
         self.loop = get_event_loop()
 
+    def _clip_prompt_ids(self, prompt_ids: list[int]) -> list[int]:
+        return clip_prompt_token_ids_to_max_length(prompt_ids, self.rollout_config.prompt_length)
+
     async def process_vision_info(self, messages: list[dict]) -> dict:
         """Extract images and videos from messages.
 
@@ -425,6 +428,19 @@ def register(agent_name: str):
         return subclass
 
     return decorator
+
+
+def clip_prompt_token_ids_to_max_length(prompt_ids: list[int], max_length: int) -> list[int]:
+    """Left-truncate prompt token ids to at most ``max_length`` by keeping the suffix.
+
+    Chat checkpoints pack the active context and generation prompt at the end; dropping
+    prefix tokens matches common ``truncation_side='left'`` behavior. Used so
+    ``tokenizer.pad(..., max_length=...)`` never receives sequences longer than the
+    configured rollout prompt length (HF pad does not shrink unless ``truncation=True``).
+    """
+    if len(prompt_ids) <= max_length:
+        return prompt_ids
+    return prompt_ids[-max_length:]
 
 
 class AgentLoopWorker:
@@ -645,6 +661,17 @@ class AgentLoopWorker:
 
         # NOTE: consistent with the legacy batch version of generate_sequences that existed in the
         # deprecated vLLM SPMD rollout implementation.
+        max_pl = self.rollout_config.prompt_length
+        raw_prompt_len = len(output.prompt_ids)
+        if raw_prompt_len > max_pl:
+            logger.warning(
+                "Clipping prompt from %d to %d tokens (rollout.prompt_length); "
+                "dataset filter and agent-loop tokenization may disagree.",
+                raw_prompt_len,
+                max_pl,
+            )
+        output.prompt_ids = clip_prompt_token_ids_to_max_length(output.prompt_ids, max_pl)
+
         # prompt_ids: left padded with zeros (e.g., [0,0,0,0,1,2,3,4])
         # response_ids: right padded with zeros (e.g., [5,6,7,8,0,0,0,0])
         # input_ids: concatenation of prompt + response
@@ -667,6 +694,7 @@ class AgentLoopWorker:
             {"input_ids": output.prompt_ids},
             padding="max_length",
             max_length=self.rollout_config.prompt_length,
+            truncation=True,
             return_tensors="pt",
             return_attention_mask=True,
         )

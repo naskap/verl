@@ -208,7 +208,7 @@ class ToolAgentLoop(AgentLoopBase):
             images=agent_data.image_data,
             videos=agent_data.video_data,
         )
-        agent_data.prompt_ids = prompt_ids
+        agent_data.prompt_ids = self._clip_prompt_ids(prompt_ids)
         return AgentState.GENERATING
 
     async def _handle_generating_state(
@@ -216,6 +216,8 @@ class ToolAgentLoop(AgentLoopBase):
     ) -> AgentState:
         """Handle the generating state: generate model response and check for tool calls."""
         add_messages: list[dict[str, Any]] = []
+
+        agent_data.prompt_ids = self._clip_prompt_ids(agent_data.prompt_ids)
 
         with simple_timer("generate_sequences", agent_data.metrics):
             output: TokenOutput = await self.server_manager.generate(
