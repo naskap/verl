@@ -506,7 +506,7 @@ class RayPPOTrainer:
         self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
 
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
-        reward_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
+        reward_keys = set({"data_source", "reward_model", "extra_info", "uid", "prompt", "raw_prompt", "multi_modal_inputs"}) & batch.non_tensor_batch.keys()
 
         # pop those keys for generation
         batch_keys_to_pop = []
@@ -1372,6 +1372,11 @@ class RayPPOTrainer:
         next_step_profile = False
 
         for epoch in range(current_epoch, self.config.trainer.total_epochs):
+            epoch_pre_rollout_filtered = 0
+            epoch_post_rollout_filtered = 0
+            epoch_pre_rollout_total = 0
+            epoch_post_rollout_total = 0
+            
             for batch_dict in self.train_dataloader:
                 if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
                     self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=False)
@@ -1398,10 +1403,14 @@ class RayPPOTrainer:
                 # greso pre-rollout probabilistic filtering
                 if self.greso:
                     prompts_decoded = batch.non_tensor_batch["prompt"]
+                    epoch_pre_rollout_total += len(prompts_decoded)
                     filtered_batch = self.prompt_tracker.pre_rollout_probabilistic_filter(batch, prompts_decoded)
                     
                     if filtered_batch is not None:
+                        epoch_pre_rollout_filtered += len(prompts_decoded) - len(filtered_batch.batch)
                         self.pre_rollout_buffer.append(filtered_batch)
+                    else:
+                        epoch_pre_rollout_filtered += len(prompts_decoded)
                         
                     if len(self.pre_rollout_buffer) < self.adaptive_sampling_bs:
                         continue
@@ -1420,7 +1429,10 @@ class RayPPOTrainer:
                         if curr_step_profile:
                             self.async_rollout_manager.start_profile()
                         gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
-                        self.checkpoint_manager.sleep_replicas()
+                        
+                        if not self.greso:
+                            self.checkpoint_manager.sleep_replicas()
+
                         if curr_step_profile:
                             self.async_rollout_manager.stop_profile()
 
@@ -1465,6 +1477,16 @@ class RayPPOTrainer:
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
+
+                    # Remove duplicated keys in meta_info that are also in non_tensor_batch or batch 
+                    # to prevent to_tensordict from failing across various computations
+                    keys_to_pop = []
+                    for k in batch.meta_info.keys():
+                        if k in batch.batch or k in batch.non_tensor_batch:
+                            keys_to_pop.append(k)
+                    for k in keys_to_pop:
+                        batch.meta_info.pop(k)
+
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
                     # which won't affect the advantage calculation (since it's based on uid),
@@ -1472,8 +1494,7 @@ class RayPPOTrainer:
                     if self.config.trainer.balance_batch:
                         self._balance_batch(batch, metrics=metrics)
 
-                    # compute global_valid tokens
-                    batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
+
                     # get images_seqlens
                     images_seqlens_all = []
                     for multi_modal_input in batch.non_tensor_batch["multi_modal_inputs"]:
@@ -1497,6 +1518,10 @@ class RayPPOTrainer:
                                 batch, reward_tensor, n_responses_per_prompt
                             )
                             
+                            num_prompts_this_batch = len(reward_tensor) // n_responses_per_prompt
+                            epoch_post_rollout_total += num_prompts_this_batch
+                            epoch_post_rollout_filtered += int(num_prompts_this_batch * zero_var_ratio)
+                            
                             if filtered_batch is not None:
                                 self.post_rollout_buffer.append(filtered_batch)
                                 
@@ -1519,6 +1544,11 @@ class RayPPOTrainer:
                             # re-extract reward_tensor and reward_extra_infos_dict since batch changed
                             reward_tensor, reward_extra_infos_dict = extract_reward(batch)
 
+                            self.checkpoint_manager.sleep_replicas()
+
+                    # compute global_valid tokens
+                    batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
+                    
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
                     # - Decoupled mode: Recomputes old_log_probs as proximal anchor (3 policies: π_rollout, π_old, π_θ)
@@ -1638,6 +1668,7 @@ class RayPPOTrainer:
                     if self.config.trainer.critic_warmup > self.global_steps:
                         # Still in critic warmup, only update weights to wake up rollout replicas.
                         self.checkpoint_manager.update_weights(self.global_steps)
+                        
                     else:
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
@@ -1669,21 +1700,28 @@ class RayPPOTrainer:
                         with marked_timer("update_weights", timing_raw, color="red"):
                             self.checkpoint_manager.update_weights(self.global_steps)
 
+                        if self.greso:
+                            self.pre_rollout_buffer = DataProtoBuffer()
+                            self.post_rollout_buffer = DataProtoBuffer()
+
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
 
                     if self.greso:
+                        import json
                         # Update prompt history tracker
                         prompts_decoded = batch.non_tensor_batch["prompt"]
                         scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
                         
-                        
                         prompt_to_scores = defaultdict(list)
+                        prompt_to_raw = {}
                         for pt, score in zip(prompts_decoded, scores):
-                            prompt_to_scores[pt].append(score)
+                            pt_str = json.dumps(pt, sort_keys=True) if not isinstance(pt, str) else pt
+                            prompt_to_scores[pt_str].append(score)
+                            prompt_to_raw[pt_str] = pt
                             
-                        pt_list = list(prompt_to_scores.keys())
-                        rw_list = [prompt_to_scores[pt] for pt in pt_list]
+                        pt_list = [prompt_to_raw[pt_str] for pt_str in prompt_to_scores.keys()]
+                        rw_list = list(prompt_to_scores.values())
                         self.prompt_tracker.update(self.global_steps, pt_list, rw_list)
                         
                         num_prompts = len(pt_list)
@@ -1789,3 +1827,14 @@ class RayPPOTrainer:
                 if hasattr(self.train_dataset, "on_batch_end"):
                     # The dataset may be changed after each training batch
                     self.train_dataset.on_batch_end(batch=batch)
+
+            if self.greso:
+                logger.log(
+                    data={
+                        "greso/epoch_pre_rollout_filtered": epoch_pre_rollout_filtered,
+                        "greso/epoch_post_rollout_filtered": epoch_post_rollout_filtered,
+                        "greso/epoch_pre_rollout_total": epoch_pre_rollout_total,
+                        "greso/epoch_post_rollout_total": epoch_post_rollout_total,
+                    },
+                    step=self.global_steps
+                )

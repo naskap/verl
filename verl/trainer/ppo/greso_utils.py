@@ -9,7 +9,7 @@ from verl.protocol import DataProto
 
 
 # Adaptive batch size calculation
-def get_next_target_size(self, b_delta: int, default_batch_size: int, zero_variance_ratio: float, beta: float = 1.25) -> int:
+def get_next_target_size(b_delta: int, default_batch_size: int, zero_variance_ratio: float, beta: float = 1.25) -> int:
     
     expected_samples = (beta * b_delta) / max(1.0 - zero_variance_ratio, 0.01)
     return max(min(default_batch_size, math.ceil(expected_samples)), 64) # The max here is in the original implementation but undocumented in the paper
