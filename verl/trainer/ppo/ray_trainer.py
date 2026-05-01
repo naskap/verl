@@ -335,6 +335,8 @@ class RayPPOTrainer:
         self.use_prefix_grouper = self.config.actor_rollout_ref.actor.get("use_prefix_grouper", False)
         self.use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
 
+        self.sampling_num = 0
+
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
         self.checkpoint_manager = None
@@ -971,6 +973,11 @@ class RayPPOTrainer:
             prompt_tracker_path = os.path.join(local_global_step_folder, "prompt_tracker.json")
             self.prompt_tracker.save(prompt_tracker_path)
 
+        # save self.sampling_num
+        local_sampling_num = os.path.join(self.config.trainer.default_local_dir, 'sampling_num.txt')
+        with open(local_sampling_num, 'w') as f:
+            f.write(str(self.sampling_num))
+
         # latest checkpointed iteration tracker (for atomic usage)
         if (
             hasattr(self.config.actor_rollout_ref.actor.checkpoint, "async_save")
@@ -1057,6 +1064,14 @@ class RayPPOTrainer:
         if getattr(self, "greso", False):
             prompt_tracker_path = os.path.join(global_step_folder, "prompt_tracker.json")
             self.prompt_tracker.load(prompt_tracker_path)
+
+        # load self.sampling_num
+        local_sampling_num = os.path.join(self.config.trainer.default_local_dir, 'sampling_num.txt')
+        if os.path.exists(local_sampling_num):
+            with open(local_sampling_num, 'r') as f:
+                self.sampling_num = int(f.read().strip())
+        else:
+            self.sampling_num = 0
 
     def _start_profiling(self, do_profile: bool) -> None:
         """Start profiling for all worker groups if profiling is enabled."""
@@ -1470,6 +1485,10 @@ class RayPPOTrainer:
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
+
+                    # generation accumulation
+                    self.sampling_num += len(batch)
+
                     if self._should_compute_teacher_colocate(batch):
                         with marked_timer("teacher", timing_raw, color="cyan"):
                             batch_teacher = self._compute_teacher_colocate(batch)
@@ -1743,9 +1762,7 @@ class RayPPOTrainer:
                         self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
 
                 # validate
-                if self.config.trainer.test_freq > 0 and (
-                    is_last_step or self.global_steps % self.config.trainer.test_freq == 0
-                ):
+                if is_last_step or self.global_steps % self.config.trainer.test_freq == 1:
                     with marked_timer("testing", timing_raw, color="green"):
                         val_metrics: dict = self._validate()
                         if is_last_step:
@@ -1805,7 +1822,13 @@ class RayPPOTrainer:
                 logger.log(data=metrics, step=self.global_steps)
 
                 progress_bar.update(1)
+
+                print(f'epoch: {epoch}')
+                print(f'Global_steps done: {self.global_steps}')
+                print(f'sampling_num: {self.sampling_num}')
+                # reward_metrics = {}
                 self.global_steps += 1
+                print(f'Start global_steps: {self.global_steps}')
 
                 if (
                     hasattr(self.config.actor_rollout_ref.actor, "profiler")
